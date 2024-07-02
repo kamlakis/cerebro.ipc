@@ -6,9 +6,8 @@ import java.util.concurrent.TimeoutException;
 import lombok.extern.log4j.Log4j2;
 import net.lakis.cerebro.ipc.config.IpcClientConfig;
 import net.lakis.cerebro.ipc.config.IpcSocketConfig;
+import net.lakis.cerebro.ipc.socket.SocketFactory;
 import net.lakis.cerebro.ipc.workers.HealthcheckTimedWorker;
-import net.lakis.cerebro.socket.SocketFactory;
-import net.lakis.cerebro.socket.config.SocketConfig;
 
 @Log4j2
 public class IpcClientSessionsPool extends IpcSessionsPool implements IpcSessionStateListener {
@@ -78,8 +77,8 @@ public class IpcClientSessionsPool extends IpcSessionsPool implements IpcSession
 		log.debug("socket pool closed");
 	}
 
-	public IpcSession createSession(SocketConfig socketConfig) {
-		return super.createSession(new SocketFactory(socketConfig));
+	public IpcSession createSession(IpcSocketConfig<?> config) {
+		return super.createSession(new SocketFactory(config.getHost(), config.getPort(), config.getTimeout()));
 	}
 	
 	

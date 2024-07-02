@@ -3,7 +3,7 @@ package net.lakis.cerebro.ipc.workers;
 import net.lakis.cerebro.ipc.IpcServerSessionsPool;
 import net.lakis.cerebro.ipc.IpcSession;
 import net.lakis.cerebro.jobs.Worker;
-
+ 
 public class AcceptSessionsWorker extends Worker {
 
 	private IpcServerSessionsPool ipcServerSessionsPool;

@@ -6,28 +6,24 @@ import java.util.Collection;
 import lombok.experimental.Accessors;
 import lombok.extern.log4j.Log4j2;
 import net.lakis.cerebro.ipc.config.IpcServerConfig;
+import net.lakis.cerebro.ipc.socket.TcpSocketServer;
+import net.lakis.cerebro.ipc.socket.exceptions.SocketServerCreateException;
 import net.lakis.cerebro.ipc.workers.AcceptSessionsWorker;
 import net.lakis.cerebro.jobs.Worker;
-import net.lakis.cerebro.socket.SocketServerFactory;
-import net.lakis.cerebro.socket.exceptions.SocketServerCreateException;
-import net.lakis.cerebro.socket.server.ISocketServer;
 
 @Accessors(fluent = true, chain = true)
 @Log4j2
 public class IpcServerSessionsPool extends IpcSessionsPool {
 	private Worker acceptSessionsWorker;
-	private SocketServerFactory socketFactory;
-	private ISocketServer server;
+	private TcpSocketServer server;
 
 	public IpcServerSessionsPool(IpcServerConfig config) {
 		super(config);
-
-		this.socketFactory = new SocketServerFactory(config.socket());
+		this.server = new TcpSocketServer(config.host(), config.port());
 		this.acceptSessionsWorker = new AcceptSessionsWorker(this);
 
 	}
 
-	
 	@Override
 	public void stateChanged(IpcSession session, IpcSessionState previousState, IpcSessionState currentState) {
 		try {
@@ -51,23 +47,21 @@ public class IpcServerSessionsPool extends IpcSessionsPool {
 		}
 	}
 
-	
 	public Collection<IpcSession> getAllSessions() {
-		
+
 		Collection<IpcSession> sessionsSet = super.getAllSessions();
 		sessionsSet.removeIf((session) -> {
 			return session.socket() == null;
 		});
 		return sessionsSet;
 	}
-	
-	
+
 	public synchronized void open() throws SocketServerCreateException {
 		if (this.state() != IpcSessionState.CLOSED) {
 			log.debug("Session pool already open");
 			return;
 		}
-		this.server = socketFactory.createServer();
+		this.server.bind();
 		this.acceptSessionsWorker.start();
 
 		setState(IpcSessionState.OPEN);
@@ -100,5 +94,4 @@ public class IpcServerSessionsPool extends IpcSessionsPool {
 
 	}
 
-	
 }

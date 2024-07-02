@@ -31,10 +31,13 @@ public class HealthcheckTimedWorker extends TimedWorker {
 	private void check(IpcSession session) {
 		try {
 			if (session.state() == IpcSessionState.CLOSED) {
+				log.trace("session is closed, open it now") ;
+
 				session.open();
 			}
 
 			if (session.state() != IpcSessionState.BOUND) {
+				log.trace("session is not bound, bind it now") ;
 				session.bind();
 			}
 		} catch (Exception e) {

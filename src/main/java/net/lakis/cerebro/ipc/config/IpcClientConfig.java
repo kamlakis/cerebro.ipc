@@ -4,7 +4,7 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
 import lombok.experimental.Accessors;
-
+ 
 @Accessors(fluent = true, chain = true)
 @Getter
 @Setter

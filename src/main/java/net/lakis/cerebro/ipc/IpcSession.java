@@ -3,9 +3,11 @@ package net.lakis.cerebro.ipc;
 import java.io.EOFException;
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Consumer;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -13,19 +15,22 @@ import lombok.experimental.Accessors;
 import lombok.extern.log4j.Log4j2;
 import net.lakis.cerebro.ipc.config.IpcClientConfig;
 import net.lakis.cerebro.ipc.config.IpcConfig;
+import net.lakis.cerebro.ipc.event.SessionStateChangeEvent;
+import net.lakis.cerebro.ipc.exceptions.SessionException;
 import net.lakis.cerebro.ipc.ipm.Ipm;
-import net.lakis.cerebro.ipc.ipm.IpmBindRequest;
-import net.lakis.cerebro.ipc.ipm.IpmBindResponse;
-import net.lakis.cerebro.ipc.ipm.IpmData;
-import net.lakis.cerebro.ipc.ipm.IpmEnquireLinkResponse;
-import net.lakis.cerebro.ipc.workers.EnquireLinkTimedWorker;
+import net.lakis.cerebro.ipc.processors.BindProcessor;
+import net.lakis.cerebro.ipc.processors.IpmProcessor;
+import net.lakis.cerebro.ipc.processors.PingProcessor;
+import net.lakis.cerebro.ipc.socket.SocketFactory;
+import net.lakis.cerebro.ipc.socket.TcpSocket;
+import net.lakis.cerebro.ipc.socket.exceptions.SocketClientCreateException;
 import net.lakis.cerebro.ipc.workers.IpmReceiverWorker;
 import net.lakis.cerebro.ipc.workers.IpmSenderConsumer;
+import net.lakis.cerebro.ipc.workers.PingTimedWorker;
+import net.lakis.cerebro.jobs.async.AsyncExecutor;
+import net.lakis.cerebro.jobs.async.AsyncResponseHandler;
 import net.lakis.cerebro.jobs.prosumer.Prosumer;
 import net.lakis.cerebro.jobs.prosumer.ProsumerFactory;
-import net.lakis.cerebro.socket.SocketFactory;
-import net.lakis.cerebro.socket.client.ISocket;
-import net.lakis.cerebro.socket.exceptions.SocketClientCreateException;
 
 @Log4j2
 @Accessors(fluent = true, chain = true)
@@ -36,8 +41,9 @@ public class IpcSession {
 	private @Getter SocketFactory socketFactory;
 
 	private @Getter List<IpcSessionStateListener> sessionStateListeners;
+	private @Getter Set<IpmProcessor> ipmProcessors;
 
-	private @Getter ISocket socket;
+	private @Getter TcpSocket socket;
 
 	protected @Getter volatile IpcSessionState state = IpcSessionState.CLOSED;
 	private volatile int sequence;
@@ -45,9 +51,10 @@ public class IpcSession {
 
 	private Prosumer<Ipm> senderProsumer;
 	private IpmReceiverWorker receiverWorker;
-	private EnquireLinkTimedWorker enquireLinkTimedWorker;
+	private AsyncExecutor<Ipm> asyncExecutor;
+	private PingTimedWorker pingTimedWorker;
 	private boolean isClient;
-//	private @Getter @Setter String localAppId;
+	private @Getter @Setter String localAppId;
 	private @Getter @Setter String remoteAppId;
 	private Object userData;
 	private Object configData;
@@ -56,22 +63,25 @@ public class IpcSession {
 	/**
 	 * Constructor for Session.
 	 */
-	public IpcSession(IpcSessionsPool pool, IpcConfig config, List<IpcSessionStateListener> sessionStateListeners,
-			SocketFactory socketFactory) {
+	public IpcSession(IpcSessionsPool pool, IpcConfig config, Set<IpmProcessor> ipmProcessors,
+			List<IpcSessionStateListener> sessionStateListeners, SocketFactory socketFactory) {
 		this.pool = pool;
 
 		this.config = config;
 		this.socketFactory = socketFactory;
-//		this.localAppId = config.appId();
+		this.localAppId = config.appId();
 		this.isClient = (config instanceof IpcClientConfig);
 
+		this.ipmProcessors = ipmProcessors;
 		this.sessionStateListeners = sessionStateListeners;
 
 		this.senderProsumer = ProsumerFactory.createBlockingProsumer(getName() + "_IpmSenderProsumer",
 				new IpmSenderConsumer(this));
 		this.receiverWorker = new IpmReceiverWorker(this);
-		if (config.enquireLinkTimer() > 0)
-			this.enquireLinkTimedWorker = new EnquireLinkTimedWorker(this, config.enquireLinkTimer());
+		this.asyncExecutor = new AsyncExecutor<Ipm>(getName() + "_AsyncExecutor", config.incomingThreads(),
+				config.timeout());
+		if (config.pingTimer() > 0)
+			this.pingTimedWorker = new PingTimedWorker(this, config.pingTimer());
 
 		this.touch();
 	}
@@ -85,23 +95,30 @@ public class IpcSession {
 	}
 
 	public void setState(IpcSessionState state) {
-		try {
-			if (this.state == state)
-				return;
-			IpcSessionState oldState = this.state;
-			this.state = state;
+		if (this.state == state)
+			return;
 
-			for (IpcSessionStateListener listener : sessionStateListeners) {
-				listener.stateChanged(this, oldState, state);
+		this.asyncExecutor.execute(new SessionStateChangeEvent(this, this.state, state)
 
-			}
+				, 1000);
+//		try {
+//			for (IpcSessionStateListener listener : sessionStateListeners) {
+//				listener.stateChanged(this, this.state, state);
+//			}
+//		} catch (Exception e) {
+//			log.error("Exception: ", e);
+//			if(state == IpcSessionState.BOUND)
+//				this.setState(IpcSessionState.UNBOUND);
+//			return;
+//		}
 
-			if (this.state != IpcSessionState.BOUND)
-				this.remoteAppId = null;
-		} catch (Exception e) {
-			log.error("Exception", e);
-			this.state = IpcSessionState.UNBOUND;
-		}
+		log.trace("set State {} appId {}", state, remoteAppId);
+		this.state = state;
+		if (this.state != IpcSessionState.BOUND)
+			this.remoteAppId = null;
+
+		log.trace("set State {} appId {} done", state, remoteAppId);
+
 		if (config.closeWhenUnbound() && state == IpcSessionState.UNBOUND) {
 			close();
 		}
@@ -128,6 +145,50 @@ public class IpcSession {
 		this.senderProsumer.handleIfRunning(ipm);
 	}
 
+	public synchronized void send(Ipm ipm, IpmResponseHandler responseHandler) {
+		ipm.sequence(++sequence);
+		this.asyncExecutor.schedule(ipm.sequence(), new AsyncResponseHandler<Ipm>() {
+
+			@Override
+			public void onTimeout() {
+				responseHandler.onResponse(null, new TimeoutException());
+			}
+
+			@Override
+			public void onResponse(Ipm response) {
+				responseHandler.onResponse(response, null);				
+			}
+		});
+		if (this.senderProsumer.handleIfRunning(ipm) == false)
+			this.asyncExecutor.responded(ipm.sequence(), null);
+	}
+
+	public synchronized Future<Ipm> sendRequest(Ipm ipm) {
+		Future<Ipm> future = null;
+
+		ipm.sequence(++sequence);
+		future = this.asyncExecutor.schedule(ipm.sequence());
+
+		if (this.senderProsumer.handleIfRunning(ipm) == false)
+			this.asyncExecutor.responded(ipm.sequence(), null);
+		return future;
+	}
+
+	public void handle(Ipm ipm) {
+		if (ipm.tag() == Ipm.RESPONSE_TAG) {
+			this.asyncExecutor.responded(ipm.sequence(), ipm);
+		} else if (ipm.tag() == Ipm.BIND_TAG) {
+			this.asyncExecutor.execute(new BindProcessor(this, ipm));
+		} else if (ipm.tag() == Ipm.PING_TAG) {
+			this.asyncExecutor.execute(new PingProcessor(this, ipm));
+		} else {
+
+			for (IpmProcessor processor : ipmProcessors) {
+				this.asyncExecutor.execute(() -> processor.process(this, ipm));
+			}
+		}
+	}
+
 	public int getTimeout() {
 		return this.config.timeout();
 	}
@@ -140,9 +201,13 @@ public class IpcSession {
 		setState(IpcSessionState.CLOSED);
 
 		// Stop auto enquire link
-		if (this.enquireLinkTimedWorker != null) {
-			enquireLinkTimedWorker.stop();
+		if (this.pingTimedWorker != null) {
+			pingTimedWorker.stop();
 		}
+
+		this.asyncExecutor.stop();
+		this.asyncExecutor.clear();
+
 		this.receiverWorker.stop();
 
 		this.senderProsumer.stopWorkers();
@@ -162,8 +227,8 @@ public class IpcSession {
 		log.debug("socket closed");
 	}
 
-	public synchronized void open()
-			throws SocketClientCreateException, InterruptedException, ExecutionException, TimeoutException {
+	public synchronized void open() throws SocketClientCreateException, SessionException, InterruptedException,
+			ExecutionException, TimeoutException {
 		if (this.state != IpcSessionState.CLOSED) {
 			log.debug("Session already open");
 			return;
@@ -173,9 +238,10 @@ public class IpcSession {
 
 		this.senderProsumer.startWorkers();
 		this.receiverWorker.start();
+		this.asyncExecutor.start();
 
-		if (this.enquireLinkTimedWorker != null) {
-			enquireLinkTimedWorker.start();
+		if (this.pingTimedWorker != null) {
+			pingTimedWorker.start();
 		}
 
 		setState(IpcSessionState.OPEN);
@@ -204,14 +270,19 @@ public class IpcSession {
 	public void bind(long timeout) throws InterruptedException, ExecutionException, TimeoutException {
 		if (!isClient)
 			throw new ExecutionException("only client session can bind to server peer", null);
+		Future<Ipm> future = this.sendRequest(new Ipm().tag(Ipm.BIND_TAG).data(localAppId));
 		try {
-			this.state = IpcSessionState.UNBOUND;
-			this.send(new IpmBindRequest().appId(config.appId()));
-			synchronized (this) {
-				this.wait();
-			}
-			if (this.state != IpcSessionState.BOUND)
-				throw new ExecutionException("bind failed", null);
+			Ipm response = future.get(timeout, TimeUnit.MILLISECONDS);
+			if (response == null)
+				throw new ExecutionException("bind failed. repsonse null", null);
+
+			if (response.data() == null || response.data().length == 0)
+				throw new ExecutionException("bind failed. repsonse " + response, null);
+
+			this.remoteAppId = response.dataAsString();
+			log.trace("bind as ={}", remoteAppId) ;
+
+			setState(IpcSessionState.BOUND);
 
 		} catch (Exception e) {
 			setState(IpcSessionState.UNBOUND);
@@ -219,50 +290,8 @@ public class IpcSession {
 		}
 	}
 
-//	/**
-//	 * Unbinds from remote entity.
-//	 *
-//	 * @throws TimeoutException
-//	 * @throws ExecutionException
-//	 * @throws InterruptedException
-//	 */
-//	public void unbind() throws InterruptedException, ExecutionException, TimeoutException {
-//		unbind(config.timeout());
-//	}
-
-	/**
-	 * Unbinds from remote entity.
-	 *
-	 * @param timeout maximum time in ms to wait for response. If set to 0 wait
-	 *                forever.
-	 * @throws TimeoutException
-	 * @throws ExecutionException
-	 * @throws InterruptedException
-	 */
-//	public void unbind(long timeout) throws InterruptedException, ExecutionException, TimeoutException {
-//		this.send(new UnbindIpm());
-////		Future<IpmResponse> future = this.send(new UnbindIpm());
-//
-////		IpmResponse response = future.get(timeout, TimeUnit.MILLISECONDS);
-////		
-////		if (response == null)
-////			throw new ExecutionException("Unbind failed. repsonse null", null);
-////
-////		if (!response.resultCode().isSuccess())
-////			throw new ExecutionException("Unbind failed. repsonse " + response.resultCode(), null);
-//
-//		setState(IpcSessionState.UNBOUND);
-//	}
-
-//	public void unbindAndClose() throws InterruptedException, ExecutionException, TimeoutException {
-//		try {
-//			if (state == IpcSessionState.BOUND) {
-//				unbind();
-//			}
-//		} finally {
-//			close();
-//		}
-//	}
+ 
+ 
 
 	@Override
 	public String toString() {
@@ -297,36 +326,22 @@ public class IpcSession {
 		this.configData = configData;
 	}
 
+	public int getPendingResponses() {
+		return asyncExecutor.size();
+	}
+
+	public int pendingJobs() {
+		return asyncExecutor.pendingJobs();
+	}
+
 	public String getName() {
 		return config().name() + "_" + config().appId() + "_" + socketFactory.toString();
 	}
 
-	public void handleBindRequest(IpmBindRequest request) {
-		this.remoteAppId = request.appId();
-		this.setState(IpcSessionState.BOUND);
-		this.send(new IpmBindResponse().appId(this.config.appId()));
-	}
-
-	public void handleBindResponse(IpmBindResponse response) {
-		this.remoteAppId = response.appId();
-		this.setState(IpcSessionState.BOUND);
-		synchronized (this) {
-			this.notifyAll();
-		}
-	}
-
-	public void handleEnquireLinkRequest() {
-		this.send(new IpmEnquireLinkResponse());
-	}
-
-	public void handleEnquireLinkResponse() {
-		this.enquireLinkTimedWorker.responded();
-	}
-
-	public void handleData(IpmData data) {
-		Consumer<IpmData> handler = this.pool.ipmDataHandler();
-		if (handler != null)
-			handler.accept(data);
+	public String sizeReport() {
+//		return String.format(", null)
+		return String.format("%d,%d,%d", asyncExecutor.size(), asyncExecutor.pendingJobs(),
+				senderProsumer.pendingJobs());
 	}
 
 }

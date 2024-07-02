@@ -12,7 +12,9 @@ import lombok.experimental.Accessors;
 public class IpcConfig {
 	private String appId;
 	private boolean  closeWhenUnbound = true;
- 	private int timeout = 20 * 1000;
-	private int enquireLinkTimer;
+	private int incomingThreads = 1;
+	private int timeout = 20 * 1000;
+	private int pingTimer;
 	private String name;
- }
+	private String tracer;
+}
